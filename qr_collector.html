@@ -3,75 +3,169 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>QR Collector — Secure POST</title>
+  <title>QR Collector — secure</title>
   <script src="https://unpkg.com/html5-qrcode"></script>
   <style>
-    body{font-family:system-ui;margin:16px;}
-    button{padding:8px 12px;margin:4px;}
-    #log{white-space:pre-wrap;border:1px solid #ddd;padding:8px;min-height:100px;}
+    body{font-family:system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin:16px}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    button{padding:8px 12px;border:1px solid #ccc;border-radius:8px;background:#f6f6f6}
+    button:active{transform:scale(0.98)}
+    input,select{padding:8px;border:1px solid #ccc;border-radius:8px}
+    #log{white-space:pre-wrap;background:#fafafa;border:1px solid #eee;border-radius:8px;padding:8px;min-height:120px}
+    #counter{font-weight:600}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef;border:1px solid #ccd}
+    .muted{color:#666}
   </style>
 </head>
 <body>
-  <h1>QR Collector</h1>
-  <p>iPhoneのSafariで開き、カメラ許可→QR連続読み取り→CSV/TXT保存 または Google Apps Scriptへ安全に送信。</p>
+  <h1 style="margin:0 0 8px">QR Collector</h1>
+  <p class="muted" style="margin-top:0">iPhoneのSafariで開き、カメラ許可→連続読み取り→重複除外→CSV/TXT保存／Apps Scriptへ安全にPOST。</p>
 
-  <button id="start">スキャン開始</button>
-  <button id="stop" disabled>停止</button>
-  <button id="send">Apps Scriptへ送信</button>
+  <div class="row" style="margin:12px 0">
+    <button id="btn-start">スキャン開始</button>
+    <button id="btn-stop" disabled>停止</button>
+    <label class="row">区切り
+      <select id="sep">
+        <option value=",">,（カンマ）</option>
+        <option value="\n">改行</option>
+      </select>
+    </label>
+    <label class="row"><input type="checkbox" id="dedup"/> 重複を除外</label>
+    <label class="row"><input type="checkbox" id="trim" checked/> 前後空白を除去</label>
+  </div>
 
-  <p>件数: <span id="count">0</span></p>
+  <div id="reader" style="width: 100%; max-width: 520px"></div>
+
+  <div style="margin:12px 0" class="row">
+    <span>件数: <span id="counter">0</span></span>
+    <span class="pill" id="last">last: -</span>
+  </div>
+
+  <div class="row" style="margin:12px 0">
+    <button id="btn-undo">1件戻す</button>
+    <button id="btn-clear">クリア</button>
+    <button id="btn-copy">クリップボードにコピー</button>
+    <button id="btn-dl-csv">CSV保存</button>
+    <button id="btn-dl-txt">TXT保存</button>
+  </div>
+
+  <details style="margin:12px 0">
+    <summary>PCへHTTP POST（Apps Script推奨・共有シークレット送信）</summary>
+    <div class="row" style="margin-top:8px">
+      <input id="post-url" placeholder="https://script.google.com/macros/s/AKfycbz6J5K9Wsj2sZb3Y1Xj48nvnsMmH2h2VzNXF5rgeucr5wWD7w3RG0EEEinbT0hsHlLI/exec" style="min-width:320px"/>
+      <button id="btn-post">送信</button>
+      <span class="muted">本文: rawテキスト（Content-Type: text/plain, ヘッダ: X-QR-Token）</span>
+    </div>
+  </details>
+
+  <h3 style="margin:12px 0 4px">プレビュー</h3>
   <div id="log"></div>
 
   <script>
-    // === 状態 ===
-    let html5QrCode=null;
-    let items=[];
-    const secret = 'hogehoge2025';  // Apps Script と一致させる
-    const postUrl = 'https://script.google.com/macros/s/AKfycbz6J5K9Wsj2sZb3Y1Xj48nvnsMmH2h2VzNXF5rgeucr5wWD7w3RG0EEEinbT0hsHlLI/exec'; // あなたのURL
+    // === 設定（必要に応じて固定） ===
+    const SECRET = 'hogehoge2025'; // Apps Script側と一致させる
+    // const DEFAULT_POST_URL = 'https://script.google.com/macros/s/XXXX/exec';
 
-    function updateLog(){
-      document.getElementById('count').textContent = items.length;
-      document.getElementById('log').textContent = items.join('\n');
+    // === 状態 ===
+    let items = [];
+    let running = false;
+    let html5QrCode = null;
+
+    // === beep音 ===
+    let audioCtx = null, lastBeep = 0;
+    function ensureAudio(){
+      if(!audioCtx){ try{ audioCtx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+      if(audioCtx && audioCtx.state==='suspended') audioCtx.resume().catch(()=>{});
+    }
+    function beep(){
+      if(!audioCtx) return; const now = Date.now(); if(now-lastBeep<120) return; lastBeep=now;
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.type='sine'; o.frequency.value=880; g.gain.setValueAtTime(0.0008, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.08, audioCtx.currentTime+0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime+0.15);
+      o.connect(g).connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime+0.18);
+    }
+
+    const els = {
+      start: document.getElementById('btn-start'),
+      stop: document.getElementById('btn-stop'),
+      sep: document.getElementById('sep'),
+      dedup: document.getElementById('dedup'),
+      trim: document.getElementById('trim'),
+      reader: document.getElementById('reader'),
+      counter: document.getElementById('counter'),
+      last: document.getElementById('last'),
+      undo: document.getElementById('btn-undo'),
+      clear: document.getElementById('btn-clear'),
+      copy: document.getElementById('btn-copy'),
+      dlCsv: document.getElementById('btn-dl-csv'),
+      dlTxt: document.getElementById('btn-dl-txt'),
+      postUrl: document.getElementById('post-url'),
+      post: document.getElementById('btn-post'),
+      log: document.getElementById('log')
+    };
+
+    function updateUI(){
+      els.counter.textContent = String(items.length);
+      els.last.textContent = 'last: ' + (items[items.length-1] ?? '-');
+      els.log.textContent = items.join(els.sep.value);
+    }
+
+    function pushItem(val){
+      const t = els.trim.checked ? (val??'').trim() : (val??'');
+      if(!t) return;
+      if(els.dedup.checked && items.includes(t)) return;
+      items.push(t); updateUI();
     }
 
     async function startScan(){
+      if(running) return; running=true; els.start.disabled=true; els.stop.disabled=false; ensureAudio();
       const cameras = await Html5Qrcode.getCameras();
-      const cam = cameras.find(c=>/back|rear|environment/i.test(c.label))||cameras[0];
-      html5QrCode = new Html5Qrcode('reader');
-      document.getElementById('start').disabled = true;
-      document.getElementById('stop').disabled = false;
-      html5QrCode.start(cam.id,{fps:15,qrbox:250},(decoded)=>{
-        if(!items.includes(decoded)){
-          items.push(decoded);
-          updateLog();
-        }
-      });
+      const backCam = cameras.find(c=>/back|rear|environment/i.test(c.label)) || cameras[0];
+      if(!backCam){ alert('カメラが見つかりません'); return stopScan(); }
+      html5QrCode = new Html5Qrcode('reader', { formatsToSupport:[Html5QrcodeSupportedFormats.QR_CODE] });
+      const onSuccess = txt => { pushItem(txt); beep(); };
+      const onFail = _ => {};
+      const config = { fps:15, qrbox:(vw,vh)=>{ const s=Math.min(350, Math.floor(Math.min(vw,vh)*0.8)); return {width:s,height:s}; } };
+      try{ await html5QrCode.start({facingMode:{exact:'environment'}}, config, onSuccess, onFail); }
+      catch(e){ await html5QrCode.start(backCam.id, config, onSuccess, onFail); }
     }
 
     async function stopScan(){
-      if(html5QrCode){await html5QrCode.stop();await html5QrCode.clear();}
-      document.getElementById('start').disabled=false;
-      document.getElementById('stop').disabled=true;
+      if(!running) return; running=false; els.start.disabled=false; els.stop.disabled=true;
+      if(html5QrCode){ try{ await html5QrCode.stop(); await html5QrCode.clear(); }catch(_){} html5QrCode=null; }
     }
 
-    async function sendData(){
-      if(!items.length){alert('データがありません');return;}
-      const body = items.join('\n');
+    function download(name, text){
+      const blob = new Blob([text], {type:'text/plain;charset=utf-8'});
+      const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url);
+    }
+
+    async function copyToClipboard(text){ try{ await navigator.clipboard.writeText(text); alert('コピーしました'); } catch(e){ alert('コピー失敗: '+e); } }
+
+    // 送信（共有シークレットをHTTPヘッダに付与）
+    els.post.onclick = async () => {
+      const url = (els.postUrl.value||'').trim(); if(!url){ alert('URLを入力'); return; }
+      const body = items.join(els.sep.value);
       try{
-        const res = await fetch(postUrl,{
-          method:'POST',
-          headers:{'Content-Type':'text/plain','X-QR-Token':secret},
-          body
-        });
-        alert('送信完了: '+res.status);
-      }catch(e){alert('送信失敗: '+e);}
-    }
+        const res = await fetch(url, { method:'POST', headers:{ 'Content-Type':'text/plain', 'X-QR-Token': SECRET }, body });
+        alert('送信: '+res.status+' '+res.statusText);
+      }catch(e){ alert('送信エラー: '+e); }
+    };
 
-    // ボタン結合
-    document.getElementById('start').onclick=startScan;
-    document.getElementById('stop').onclick=stopScan;
-    document.getElementById('send').onclick=sendData;
+    // 操作系
+    els.start.onclick = startScan;
+    els.stop.onclick = stopScan;
+    els.undo.onclick = () => { items.pop(); updateUI(); };
+    els.clear.onclick = () => { if(confirm('全て削除しますか？')){ items=[]; updateUI(); } };
+    els.copy.onclick = () => copyToClipboard(items.join(els.sep.value));
+    els.dlCsv.onclick = () => download('qrdata.csv', items.join(','));
+    els.dlTxt.onclick = () => download('qrdata.txt', items.join(els.sep.value));
+    els.sep.onchange = updateUI;
+
+    // 初期表示
+    // if (typeof DEFAULT_POST_URL !== 'undefined') els.postUrl.value = DEFAULT_POST_URL;
+    updateUI();
   </script>
-  <div id="reader" style="width:300px;margin-top:12px;"></div>
 </body>
 </html>
